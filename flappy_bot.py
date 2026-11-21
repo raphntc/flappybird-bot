@@ -13,7 +13,8 @@ Referencias de ideias:
     acao com pyautogui, loop em tempo real.
 
 Instalar (Windows/Linux/Mac):
-  pip install mss opencv-python numpy pyautogui pynput
+  pip install -r requirements.txt
+  (ou: pip install mss opencv-python numpy pyautogui pynput)
 
 Uso:
   python flappy_bot.py            -> na 1a vez calibra sozinho, depois roda o bot
@@ -30,6 +31,7 @@ Opcoes uteis:
 import argparse
 import importlib.util
 import json
+import math
 import os
 import sys
 import time
@@ -138,7 +140,7 @@ def color_mask(hsv, ref, cfg):
 def find_bird(hsv, cfg):
     """Retorna (x, y, raio_horizontal, raio_vertical) do passaro ou None. Procura numa faixa vertical
     perto do x calibrado (o passaro nao anda na horizontal)."""
-    H, W = hsv.shape[:2]
+    W = hsv.shape[1]
     bx = cfg["bird_x"]
     half = max(20, int(W * 0.15))
     x0, x1 = max(0, bx - half), min(W, bx + half)
@@ -159,7 +161,7 @@ def find_bird(hsv, cfg):
 def find_pipes(hsv, cfg):
     """Retorna lista de canos [(x_esq, x_dir, vao_topo, vao_base)] da
     esquerda pra direita."""
-    H, W = hsv.shape[:2]
+    W = hsv.shape[1]
     mask = color_mask(hsv, cfg["pipe_hsv"], cfg) > 0
     col_fill = mask.mean(axis=0)
     is_pipe = col_fill >= cfg["pipe_fill"]
@@ -494,7 +496,8 @@ class Controller:
         def safe(k, yy, vv, cool):
             if k >= n_steps:
                 return True
-            key = (k, int(yy), int(vv / 8), max(cool, 0))
+            # floor (e nao int) para nao juntar velocidades +/- no mesmo grupo
+            key = (k, math.floor(yy), math.floor(vv / 8), max(cool, 0))
             if key in memo:
                 return memo[key]
             ok = False
@@ -655,7 +658,7 @@ def auto_detect(roi):
     area_min, area_max = 0.0004 * H * W, 0.03 * H * W
     best_b = None
     for i in range(1, n):
-        x, y, w, h, a = stats[i]
+        _, _, w, h, a = stats[i]
         if not (area_min <= a <= area_max):
             continue
         if not (0.4 <= w / max(h, 1) <= 2.5) or a < 0.35 * w * h:
@@ -704,6 +707,9 @@ def manual_pick(roi):
         if cv2.waitKey(20) == 27:
             cv2.destroyAllWindows()
             return None
+        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:   # fechou no X
+            cv2.destroyAllWindows()
+            return None
     cv2.destroyAllWindows()
     (bx, by), (px, py) = [(int(cx / rs), int(cy / rs)) for cx, cy in clicks]
     return {"bird_x": bx, "bird_hsv": sample_hsv(roi, bx, by),
@@ -715,7 +721,7 @@ def review(roi, cfg):
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     bird = find_bird(hsv, cfg) if cfg.get("bird_hsv") else None
     pipes = find_pipes(hsv, cfg) if cfg.get("pipe_hsv") else []
-    dbg = draw_debug(roi, bird, pipes, None, cfg)
+    dbg = draw_debug(roi, bird, pipes, None)
     view, _ = fit(dbg, 900, 760)
     bar = np.zeros((70, view.shape[1], 3), np.uint8)
     ok = bird is not None and len(pipes) > 0
@@ -727,7 +733,10 @@ def review(roi, cfg):
     win = "Conferencia da calibracao"
     cv2.imshow(win, np.vstack([view, bar]))
     while True:
-        k = cv2.waitKey(0) & 0xFF
+        k = cv2.waitKey(50) & 0xFF
+        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:   # fechou no X
+            cv2.destroyAllWindows()
+            return "quit"
         if k in (13, 10):
             r = "accept" if ok else "manual"
         elif k in (ord("m"), ord("M")):
@@ -800,7 +809,7 @@ def calibrate(path):
 
 
 # ------------------------------------------------------------------ debug
-def draw_debug(img, bird, pipes, target, cfg):
+def draw_debug(img, bird, pipes, target):
     out = img.copy()
     for xl, xr, gt, gb in pipes:
         cv2.rectangle(out, (xl, gt), (xr, gb), (255, 0, 255), 2)
@@ -813,6 +822,25 @@ def draw_debug(img, bird, pipes, target, cfg):
 
 
 # ------------------------------------------------------------------ loop
+def check_config(cfg, path):
+    """Para com uma mensagem clara se a calibracao estiver incompleta ou
+    inconsistente (ex.: arquivo editado a mao)."""
+    fix = f"\n    Refaca a calibracao: python flappy_bot.py --calibrate --config {path}"
+    missing = [k for k in ("roi", "bird_x", "bird_hsv", "pipe_hsv") if cfg.get(k) is None]
+    if missing:
+        sys.exit(f"[!] Calibracao incompleta em '{path}': falta {', '.join(missing)}." + fix)
+    roi = cfg["roi"]
+    if not all(isinstance(roi.get(k), int) for k in ("left", "top", "width", "height")) \
+            or roi["width"] <= 0 or roi["height"] <= 0:
+        sys.exit(f"[!] 'roi' invalido em '{path}': {roi}" + fix)
+    if not 0 <= cfg["bird_x"] < roi["width"]:
+        sys.exit(f"[!] 'bird_x'={cfg['bird_x']} fica fora da area do jogo "
+                 f"(largura {roi['width']})." + fix)
+    for k in ("bird_hsv", "pipe_hsv"):
+        if not (isinstance(cfg[k], list) and len(cfg[k]) == 3):
+            sys.exit(f"[!] '{k}' invalido em '{path}': {cfg[k]}" + fix)
+
+
 def run(path, action, debug):
     import mss
     import pyautogui
@@ -825,6 +853,7 @@ def run(path, action, debug):
         with open(path) as f:
             cfg = {**DEFAULTS, **json.load(f)}
         print(f"[*] Usando calibracao de '{path}' (para refazer: --calibrate)")
+    check_config(cfg, path)
 
     pyautogui.PAUSE = 0          # sem atraso entre acoes
     pyautogui.FAILSAFE = True    # mouse no canto superior esquerdo = para tudo
@@ -871,7 +900,7 @@ def run(path, action, debug):
                 ctrl.reset()
 
             if debug:
-                dbg = draw_debug(img, bird, pipes, target, cfg)
+                dbg = draw_debug(img, bird, pipes, target)
                 cv2.putText(dbg, "ON" if state["on"] else "OFF", (5, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 cv2.imshow("flappy_bot debug", dbg)

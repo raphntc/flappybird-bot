@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Calibracao local (depende da tela de cada um)
+flappy_config.json
+
+# Editor / SO
+.vscode/
+.DS_Store
+Thumbs.db
