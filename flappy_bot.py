@@ -17,12 +17,18 @@ Instalar (Windows/Linux/Mac):
   (ou: pip install mss opencv-python numpy pyautogui pynput)
 
 Uso:
-  python flappy_bot.py            -> na 1a vez calibra sozinho, depois roda o bot
-  python flappy_bot.py --calibrate  -> refaz a calibracao (outro jogo/site)
-  Calibracao: F9 captura a tela; ele acha passaro e canos sozinho
-  (se errar, aperte M e clique neles). No jogo: F8 liga/desliga, ESC sai.
+  python flappy_bot.py              -> acha o jogo sozinho (olha as janelas
+                                       abertas ate ver passaro e canos andando),
+                                       salva a calibracao e liga o bot
+  python flappy_bot.py --recalibrate  -> ignora a calibracao salva e procura de novo
+  python flappy_bot.py --calibrate    -> calibracao manual: F9 captura a tela,
+                                       voce marca a area (M marca passaro/cano)
+  No jogo: F8 pausa/liga, ESC sai. Se o passaro some por 8 s, ele procura o
+  jogo de novo sozinho. No Windows, se F9/F8 nao funcionarem, use ENTER na
+  janela do terminal (com contagem de 3 s) e Q para sair.
 
 Opcoes uteis:
+  --no-autostart    nao liga sozinho: espera F8/ENTER
   --action space    usa a tecla espaco em vez de clique
   --debug           mostra janela com o que o bot esta vendo
   --config X.json   arquivo de calibracao (um por jogo, se quiser)
@@ -63,25 +69,61 @@ def enable_dpi_awareness():
         pass
 
 
-def wait_hotkey(key_name="f9", msg=""):
-    """Espera uma tecla global (funciona com o jogo em foco). ESC cancela."""
+def console_key():
+    """Tecla apertada na janela do terminal, sem bloquear (None se nenhuma).
+    Alternativa as teclas globais, que as vezes nao chegam (notebook com Fn,
+    janela de espelhamento/emulador que segura o teclado etc.)."""
+    if sys.platform != "win32":
+        return None
+    import msvcrt
+    if not msvcrt.kbhit():
+        return None
+    ch = msvcrt.getwch()
+    if ch in ("\x00", "\xe0"):            # teclas especiais (F1..F12, setas)
+        msvcrt.getwch()
+        return None
+    return ch
+
+
+def countdown(secs, msg):
+    for s in range(secs, 0, -1):
+        print(f"    {msg} {s}...", end="\r", flush=True)
+        time.sleep(1)
+    print(" " * 70, end="\r")
+
+
+def wait_hotkey(key_name="f9", msg="", delay=3):
+    """Espera a tecla global (funciona com o jogo em foco) OU ENTER no
+    terminal (com contagem para dar tempo de voltar ao jogo). ESC cancela."""
     from pynput import keyboard
     target = getattr(keyboard.Key, key_name)
     print(msg)
+    if sys.platform == "win32":
+        print(f"    (se o {key_name.upper()} nao funcionar: aperte ENTER aqui no terminal)")
     result = {}
 
     def on_press(k):
         if k == target:
-            result["ok"] = True
+            result["how"] = "key"
             return False
         if k == keyboard.Key.esc:
-            result["ok"] = False
+            result["how"] = "esc"
             return False
 
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
-    if not result.get("ok"):
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    while "how" not in result:
+        ch = console_key()
+        if ch in ("\r", "\n"):
+            result["how"] = "enter"
+        elif ch == "\x1b":
+            result["how"] = "esc"
+        time.sleep(0.03)
+    listener.stop()
+    if result["how"] == "esc":
         sys.exit("Cancelado.")
+    if result["how"] == "enter" and delay:
+        countdown(delay, "Deixe a janela do jogo visivel. Capturando em")
 
 
 check_deps({"cv2": "opencv-python", "numpy": "numpy"})
@@ -602,7 +644,8 @@ def auto_detect(roi):
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hch, sch, vch = hsv[:, :, 0].astype(int), hsv[:, :, 1], hsv[:, :, 2]
     colorful = (sch > 60) & (vch > 50)
-    out = {"pipe_hsv": None, "bird_hsv": None, "bird_x": None}
+    out = {"pipe_hsv": None, "bird_hsv": None, "bird_x": None,
+           "score": 0, "play_top": None, "play_bottom": None}
 
     # --- canos: testa faixas de matiz e fica com a que mais parece cano
     best = None
@@ -631,9 +674,15 @@ def auto_detect(roi):
             best = (score, hc, mask)
     pipe_cols = np.zeros(W, bool)
     if best:
-        _, hc, mask = best
+        score, hc, mask = best
         out["pipe_hsv"] = [int(v) for v in np.median(hsv[mask], axis=0)]
+        out["score"] = score
         pipe_cols = mask.mean(axis=0) >= 0.15
+        # altura da area de jogo: do topo do cano de cima ate o pe do de baixo
+        # (corta barra de titulo, barra de status do celular e o chao)
+        rows = np.flatnonzero(mask[:, mask.mean(axis=0) >= 0.25].mean(axis=1) > 0.5)
+        if len(rows):
+            out["play_top"], out["play_bottom"] = int(rows[0]), int(rows[-1])
 
     # --- passaro: maior mancha compacta colorida fora dos canos
     cand = colorful.copy()
@@ -752,12 +801,21 @@ def review(roi, cfg):
 
 
 def calibrate(path):
-    print("=" * 60)
-    print(" CALIBRACAO")
-    print("  1. Abra o jogo e deixe o passaro e pelo menos 1 cano na tela")
-    print("     (pause o jogo se der).")
-    print("  2. Com o jogo em foco, aperte F9 para capturar (ESC cancela).")
-    print("=" * 60)
+    print()
+    print("=" * 64)
+    print("  CALIBRACAO  -  ensina o bot onde esta o jogo e quais sao as cores")
+    print("=" * 64)
+    print("  ANTES DE COMECAR")
+    print("   - Abra o jogo (navegador, emulador ou celular espelhado no scrcpy).")
+    print("   - Deixe o PASSARO e pelo menos 1 CANO aparecendo (pause se der).")
+    print("   - A janela do jogo precisa estar visivel no monitor principal,")
+    print("     sem nada por cima. Nao mude ela de lugar nem de tamanho depois.")
+    print()
+    print("  PASSO 1 - CAPTURAR A TELA")
+    print("   - Com o jogo em foco, aperte F9 (em notebook: Fn+F9),")
+    print("   - ou aperte ENTER aqui no terminal: ele conta 3 s e captura.")
+    print("   - ESC cancela.")
+    print("=" * 64)
     old = {}
     if os.path.exists(path):
         with open(path) as f:
@@ -765,22 +823,30 @@ def calibrate(path):
 
     region = None
     while True:
-        wait_hotkey("f9", "[*] Esperando F9...")
+        wait_hotkey("f9", "\n[*] Esperando a captura (F9 ou ENTER)...")
         mon, full = grab_screen()
+        print("[ok] Tela capturada.")
 
         if region is None:
             small, s = fit(full, 1400, 800)
-            print("[1] Arraste um retangulo na area do jogo (do topo ate LOGO ACIMA do chao).")
-            print("    ENTER/ESPACO confirma, C cancela.")
+            print()
+            print("  PASSO 2 - MARCAR A AREA DO JOGO (abriu uma janela com a captura)")
+            print("   - Arraste um retangulo do TOPO do jogo ate LOGO ACIMA do chao.")
+            print("     No scrcpy/emulador, marque so a tela do jogo, sem as bordas.")
+            print("   - ENTER ou ESPACO confirma.  C cancela.")
             x, y, w, h = cv2.selectROI("Selecione a area do jogo", small, showCrosshair=False)
             cv2.destroyAllWindows()
             if w == 0 or h == 0:
-                sys.exit("Nenhuma area selecionada.")
+                sys.exit("[!] Nenhuma area selecionada. Rode a calibracao de novo.")
             region = [int(v / s) for v in (x, y, w, h)]
         x, y, w, h = region
         roi = full[y:y + h, x:x + w].copy()
 
-        print("[2] Detectando passaro e canos automaticamente...")
+        print()
+        print("  PASSO 3 - CONFERIR (abriu uma janela com o que o bot achou)")
+        print("   - Elipse VERMELHA = passaro.  Retangulo MAGENTA = vao do cano.")
+        print("   - ENTER aceita   M marca com o mouse   R captura de novo   ESC sai")
+        print("[*] Procurando passaro e canos...")
         found = auto_detect(roi)
         cfg = {**DEFAULTS, **{k: v for k, v in old.items() if k in DEFAULTS}}
         cfg.update(found)
@@ -788,7 +854,10 @@ def calibrate(path):
 
         choice = review(roi, cfg)
         while choice == "manual":
-            print("[3] Clique no CORPO do passaro e depois num CANO.")
+            print("\n  MARCACAO MANUAL - na janela que abriu, clique:")
+            print("   1) no CORPO do passaro (nao no olho nem no bico)")
+            print("   2) no meio de um CANO")
+            print("   ESC volta para a captura.")
             picked = manual_pick(roi)
             if picked is None:
                 choice = "retry"
@@ -799,12 +868,15 @@ def calibrate(path):
             break
         if choice == "quit":
             sys.exit("Cancelado.")
-        print("[*] Ok, posicione o jogo e aperte F9 de novo (mesma area).")
+        print("\n[*] Vamos capturar de novo (a area marcada continua a mesma).")
+        print("    Deixe o passaro e um cano na tela.")
 
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"[ok] Calibracao salva em {path}")
-    print(f"     passaro HSV={cfg['bird_hsv']}  cano HSV={cfg['pipe_hsv']}")
+    print()
+    print(f"[ok] Calibracao salva em '{path}'.")
+    print(f"     cor do passaro (HSV) = {cfg['bird_hsv']}   cor do cano (HSV) = {cfg['pipe_hsv']}")
+    print("     Se mudar a janela do jogo de lugar ou tamanho, calibre de novo.")
     return cfg
 
 
@@ -821,67 +893,290 @@ def draw_debug(img, bird, pipes, target):
     return out
 
 
+# ------------------------------------------------------------------ autocalibracao
+# janelas que nunca sao o jogo (fundo de tela, o proprio bot, o editor...)
+SKIP_TITLES = ("program manager", "windows input experience", "flappy bot", "flappy_bot")
+TUNING_KEYS = tuple(DEFAULTS) + ("robust", "max_horizon", "tiebreak")
+
+
+def game_windows():
+    """Janelas visiveis que podem conter o jogo: [(titulo, (x, y, w, h))].
+    None se nao der para listar janelas (fora do Windows)."""
+    try:
+        import pygetwindow as gw
+    except Exception:
+        return None
+    out = []
+    for w in gw.getAllWindows():
+        try:
+            title = (w.title or "").strip()
+            if not title or not w.visible or w.isMinimized:
+                continue
+            rect = (int(w.left), int(w.top), int(w.width), int(w.height))
+        except Exception:
+            continue
+        if any(s in title.lower() for s in SKIP_TITLES):
+            continue
+        if rect[2] >= 150 and rect[3] >= 200:
+            out.append((title, rect))
+    return out
+
+
+def detect_game(img):
+    """Procura passaro + canos numa imagem (de uma janela). Retorna
+    {"cfg", "y0", "y1"} com a faixa vertical da area de jogo, ou None."""
+    H, W = img.shape[:2]
+    s = min(1.0, 320 / W, 560 / H)            # reduz para detectar rapido
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else img
+    f = auto_detect(small)
+    if not (f["pipe_hsv"] and f["bird_hsv"] and f["play_top"] is not None):
+        return None
+    y0 = max(0, int(f["play_top"] / s))
+    y1 = min(H, int((f["play_bottom"] + 1) / s))
+    if y1 - y0 < 120:
+        return None
+    cfg = {**DEFAULTS, "pipe_hsv": f["pipe_hsv"], "bird_hsv": f["bird_hsv"],
+           "bird_x": min(W - 1, int(f["bird_x"] / s))}
+    # confirma na resolucao real, com os mesmos detectores do jogo
+    hsv = cv2.cvtColor(np.ascontiguousarray(img[y0:y1]), cv2.COLOR_BGR2HSV)
+    h = y1 - y0
+    pipes = find_pipes(hsv, cfg)
+    # precisa de pelo menos um cano "de verdade": cano em cima E embaixo,
+    # com um vao de tamanho razoavel no meio
+    real = [p for p in pipes if p[2] > 0 and p[3] < h - 1 and 0.12 * h < p[3] - p[2] < 0.6 * h]
+    if find_bird(hsv, cfg) is None or not real:
+        return None
+    return {"cfg": cfg, "y0": y0, "y1": y1}
+
+
+def confirm_game(sct, roi, cfg, secs=0.6):
+    """Uma foto parada engana (outras janelas podem ter algo verde e algo
+    amarelo). Aqui observa a area por alguns quadros e so aceita se os canos
+    andarem para a esquerda e o passaro continuar aparecendo."""
+    t_end = time.time() + secs
+    frames = bird_ok = pipe_ok = 0
+    moves, last_x = [], None
+    while time.time() < t_end:
+        img = np.array(sct.grab(roi))[:, :, :3]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        frames += 1
+        bird_ok += find_bird(hsv, cfg) is not None
+        pipes = [p for p in find_pipes(hsv, cfg) if p[0] > 0]
+        if pipes:
+            pipe_ok += 1
+            x = pipes[0][0]
+            if last_x is not None and 0 <= last_x - x < 0.25 * roi["width"]:
+                moves.append(last_x - x)
+            last_x = x
+        else:
+            last_x = None
+        time.sleep(0.02)
+    if frames < 5 or bird_ok < 0.7 * frames or pipe_ok < 0.7 * frames:
+        return False
+    # canos andando: a maioria das medidas com deslocamento, e no total > 4 px
+    return len(moves) >= 3 and sum(m > 0 for m in moves) >= 0.6 * len(moves) and sum(moves) > 4
+
+
+def auto_calibrate(path, should_stop=None, quiet=False):
+    """Acha o jogo sozinho: olha cada janela aberta ate encontrar uma com
+    passaro e canos, recorta a area de jogo e salva a calibracao.
+    Retorna o cfg, ou None se o usuario cancelar."""
+    import mss
+    old = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                old = {k: v for k, v in json.load(f).items() if k in TUNING_KEYS}
+        except Exception:
+            pass
+    if not quiet:
+        print()
+        print("=" * 64)
+        print("  PROCURANDO O JOGO SOZINHO")
+        print("=" * 64)
+        print("   - Abra o jogo (celular no scrcpy, emulador ou navegador) e")
+        print("     deixe a janela dele visivel, sem nada por cima.")
+        print("   - COMECE A PARTIDA: o bot precisa ver o passaro e os canos")
+        print("     ANDANDO. Toque/clique para manter o passaro vivo ate os")
+        print("     canos aparecerem; em menos de 1 s ele reconhece o jogo.")
+        print("   - Assim que achar, ele assume o jogo sozinho.")
+        print("   - Q ou ESC aqui no terminal cancela.")
+        print("=" * 64)
+    print("[*] Procurando o jogo...")
+    t0 = last_msg = time.time()
+    with mss.mss() as sct:
+        v = sct.monitors[0]                    # todas as telas juntas
+        while True:
+            if should_stop and should_stop():
+                return None
+            if console_key() in ("q", "Q", "\x1b"):
+                return None
+            wins = game_windows()
+            if wins is None:                   # sem lista de janelas: tela principal
+                m = sct.monitors[1]
+                wins = [("tela principal", (m["left"], m["top"], m["width"], m["height"]))]
+            found = []
+            for title, (x, y, w, h) in wins:
+                # recorta a parte da janela que esta dentro das telas
+                x0, y0 = max(x, v["left"]), max(y, v["top"])
+                x1 = min(x + w, v["left"] + v["width"])
+                y1 = min(y + h, v["top"] + v["height"])
+                if x1 - x0 < 150 or y1 - y0 < 200:
+                    continue
+                img = np.array(sct.grab({"left": x0, "top": y0,
+                                         "width": x1 - x0, "height": y1 - y0}))[:, :, :3]
+                r = detect_game(img)
+                if r is None:
+                    continue
+                # prefere a maior area de jogo; empate -> a menor janela (a do jogo,
+                # e nao uma janela grande atras dele que "enxerga" o mesmo jogo)
+                key = (round((r["y1"] - r["y0"]) / 20), -(x1 - x0) * (y1 - y0))
+                found.append((key, title, x0, y0, x1 - x0, r))
+            cfg = None
+            for _, title, x0, y0, w, r in sorted(found, key=lambda c: c[0], reverse=True):
+                cand = {**DEFAULTS, **old, **r["cfg"],
+                        "roi": {"left": x0, "top": y0 + r["y0"], "width": w,
+                                "height": r["y1"] - r["y0"]}}
+                if confirm_game(sct, cand["roi"], cand):
+                    cfg = cand
+                    break
+            if cfg:
+                with open(path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                roi = cfg["roi"]
+                print(f"[ok] Jogo encontrado na janela '{title}'"
+                      f" (area {roi['width']}x{roi['height']}). Calibracao salva em '{path}'.")
+                return cfg
+            if time.time() - last_msg > 15:
+                print(f"[*] Ainda procurando ({time.time() - t0:.0f} s). Comece a partida e"
+                      " deixe passaro e canos visiveis.")
+                print("    Se demorar muito, use a calibracao manual (opcao 3 do menu ou --calibrate).")
+                last_msg = time.time()
+            time.sleep(0.15)
+
+
 # ------------------------------------------------------------------ loop
-def check_config(cfg, path):
-    """Para com uma mensagem clara se a calibracao estiver incompleta ou
-    inconsistente (ex.: arquivo editado a mao)."""
-    fix = f"\n    Refaca a calibracao: python flappy_bot.py --calibrate --config {path}"
+def config_problem(cfg):
+    """Descreve o que esta errado na calibracao, ou None se estiver ok."""
     missing = [k for k in ("roi", "bird_x", "bird_hsv", "pipe_hsv") if cfg.get(k) is None]
     if missing:
-        sys.exit(f"[!] Calibracao incompleta em '{path}': falta {', '.join(missing)}." + fix)
+        return f"calibracao incompleta: falta {', '.join(missing)}"
     roi = cfg["roi"]
-    if not all(isinstance(roi.get(k), int) for k in ("left", "top", "width", "height")) \
+    if not isinstance(roi, dict) \
+            or not all(isinstance(roi.get(k), int) for k in ("left", "top", "width", "height")) \
             or roi["width"] <= 0 or roi["height"] <= 0:
-        sys.exit(f"[!] 'roi' invalido em '{path}': {roi}" + fix)
+        return f"'roi' invalido: {roi}"
     if not 0 <= cfg["bird_x"] < roi["width"]:
-        sys.exit(f"[!] 'bird_x'={cfg['bird_x']} fica fora da area do jogo "
-                 f"(largura {roi['width']})." + fix)
+        return f"'bird_x'={cfg['bird_x']} fica fora da area do jogo (largura {roi['width']})"
     for k in ("bird_hsv", "pipe_hsv"):
         if not (isinstance(cfg[k], list) and len(cfg[k]) == 3):
-            sys.exit(f"[!] '{k}' invalido em '{path}': {cfg[k]}" + fix)
+            return f"'{k}' invalido: {cfg[k]}"
+    return None
 
 
-def run(path, action, debug):
+def load_config(path):
+    """Calibracao salva, ou None se nao existir / estiver com problema."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            cfg = {**DEFAULTS, **json.load(f)}
+    except Exception as e:
+        print(f"[!] Nao consegui ler '{path}' ({e}). Vou procurar o jogo de novo.")
+        return None
+    prob = config_problem(cfg)
+    if prob:
+        print(f"[!] '{path}': {prob}. Vou procurar o jogo de novo.")
+        return None
+    return cfg
+
+
+LOST_AFTER = 8.0   # s sem ver o passaro (bot ligado) -> procura o jogo de novo
+
+
+def run(path, action, debug, fresh=False, autostart=True):
     import mss
     import pyautogui
     from pynput import keyboard
 
-    if not os.path.exists(path):
-        print(f"[*] Nenhuma calibracao em '{path}'. Vamos calibrar agora.")
-        cfg = {**DEFAULTS, **calibrate(path)}
+    cfg = None if fresh else load_config(path)
+    if cfg:
+        print(f"[*] Usando a calibracao salva em '{path}'.")
+        print(f"    Se o jogo nao estiver mais la, o bot procura sozinho depois de {LOST_AFTER:.0f} s.")
     else:
-        with open(path) as f:
-            cfg = {**DEFAULTS, **json.load(f)}
-        print(f"[*] Usando calibracao de '{path}' (para refazer: --calibrate)")
-    check_config(cfg, path)
+        cfg = auto_calibrate(path)
+        if cfg is None:
+            sys.exit("Cancelado.")
 
     pyautogui.PAUSE = 0          # sem atraso entre acoes
     pyautogui.FAILSAFE = True    # mouse no canto superior esquerdo = para tudo
-    roi = cfg["roi"]
-    click_pt = (roi["left"] + roi["width"] // 2, roi["top"] + roi["height"] // 2)
+    g = {}                       # estado que muda quando recalibra
+
+    def setup(c):
+        roi = c["roi"]
+        g.update(cfg=c, roi=roi, ctrl=Controller(c, roi["height"], roi["width"]),
+                 click=(roi["left"] + roi["width"] // 2, roi["top"] + roi["height"] // 2))
+    setup(cfg)
 
     state = {"on": False, "quit": False}
+
+    def toggle():
+        state["on"] = not state["on"]
+        print(">>> BOT LIGADO <<<" if state["on"] else ">>> bot pausado (F8 liga de novo) <<<")
+
     def on_key(k):
         if k == keyboard.Key.f8:
-            state["on"] = not state["on"]
-            print("[bot]", "LIGADO" if state["on"] else "pausado")
+            toggle()
         elif k == keyboard.Key.esc:
             state["quit"] = True
             return False
-    keyboard.Listener(on_press=on_key).start()
+    listener = keyboard.Listener(on_press=on_key)
+    listener.start()
 
     def flap():
         if action == "space":
             pyautogui.press("space")
         else:
-            pyautogui.click(*click_pt)
+            pyautogui.click(*g["click"])
 
-    print("[bot] Pronto. Clique no jogo, comece a partida e aperte F8. ESC sai.")
-    ctrl = Controller(cfg, roi["height"], roi["width"])
-    fps_t, frames = time.time(), 0
+    win = sys.platform == "win32"
+    print()
+    print("=" * 64)
+    print("  BOT PRONTO  -  pulo por " + ("tecla ESPACO" if action == "space" else "CLIQUE do mouse"))
+    print("=" * 64)
+    print("  CONTROLES")
+    print("   F8 ............ pausa / liga" + ("      (ou ENTER aqui no terminal)" if win else ""))
+    print("   ESC ........... sai" + ("               (ou Q aqui no terminal)" if win else ""))
+    print("   mouse no canto superior esquerdo da tela = parada de emergencia")
+    print()
+    print("  No comeco ele mede a fisica do jogo (gravidade, pulo, atraso) e pode")
+    print("  deixar o passaro cair ate perto do chao para isso. Depois de alguns")
+    print("  canos ele passa para o modo 'planejador' e joga bem melhor.")
+    print("  Se a janela do jogo mudar de lugar, ele procura o jogo de novo sozinho.")
+    if action != "space":
+        print("  Ele clica no centro da area do jogo: nao use o mouse enquanto ligado.")
+    print("=" * 64)
+    if autostart:
+        countdown(3, "Deixe o jogo visivel. Ligando em")
+        toggle()
+    else:
+        print("[*] Aperte F8" + (" ou ENTER aqui no terminal" if win else "") + " para ligar.")
+
+    fps_t, frames, seen = time.time(), 0, 0
+    last_seen = time.time()
 
     with mss.mss() as sct:
         while not state["quit"]:
+            ch = console_key()
+            if ch in ("\r", "\n"):
+                if not state["on"]:
+                    countdown(3, "Volte para o jogo. Ligando em")
+                toggle()
+                last_seen = time.time()
+            elif ch in ("q", "Q", "\x1b"):
+                state["quit"] = True
+                break
+            cfg, roi, ctrl = g["cfg"], g["roi"], g["ctrl"]
             img = np.array(sct.grab(roi))[:, :, :3]
             now = time.time()
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -890,6 +1185,7 @@ def run(path, action, debug):
             target = None
 
             if bird:
+                last_seen = now
                 if state["on"]:
                     if ctrl.update(now, bird, pipes):
                         flap()
@@ -898,6 +1194,21 @@ def run(path, action, debug):
                     ctrl.reset()
             else:
                 ctrl.reset()
+                if not state["on"]:
+                    last_seen = now
+                elif now - last_seen > LOST_AFTER:
+                    print(f"[!] Nao vejo o passaro ha {LOST_AFTER:.0f} s."
+                          " Procurando o jogo de novo (F8 pausa, Q sai)...")
+                    new = auto_calibrate(path, quiet=True,
+                                         should_stop=lambda: state["quit"] or not state["on"])
+                    if new:
+                        setup(new)
+                    elif state["on"]:           # Q/ESC durante a busca
+                        break
+                        print(">>> Jogo encontrado de novo. Bot continua LIGADO. <<<")
+                    last_seen = fps_t = time.time()
+                    frames = seen = 0
+                    continue
 
             if debug:
                 dbg = draw_debug(img, bird, pipes, target)
@@ -907,18 +1218,30 @@ def run(path, action, debug):
                 cv2.waitKey(1)
 
             frames += 1
+            seen += bird is not None
             if now - fps_t >= 5:
-                print(f"[bot] {frames / (now - fps_t):.0f} fps | passaro={'sim' if bird else 'nao'}"
-                      f" | canos={len(pipes)} | atraso={ctrl.latency * 1000:.0f}ms"
-                      f" | gravidade={ctrl.g:.0f}px/s2 | modo={ctrl.mode}")
-                fps_t, frames = now, 0
+                fps = frames / (now - fps_t)
+                pct = 100 * seen / frames
+                print(f"[{'LIGADO' if state['on'] else 'pausado'}] {fps:.0f} fps"
+                      f" | passaro visto {pct:.0f}% | canos {len(pipes)}"
+                      f" | atraso {ctrl.latency * 1000:.0f} ms | gravidade {ctrl.g:.0f} px/s2"
+                      f" | modo {ctrl.mode}")
+                if fps < 20:
+                    print("    [!] FPS baixo: feche a janela de debug e outros programas pesados.")
+                fps_t, frames, seen = now, 0, 0
 
+    listener.stop()
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Bot universal de Flappy Bird")
-    ap.add_argument("--calibrate", action="store_true", help="calibra area e cores")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="calibracao manual (F9/ENTER + marcar a area com o mouse)")
+    ap.add_argument("--recalibrate", action="store_true",
+                    help="ignora a calibracao salva e procura o jogo de novo sozinho")
+    ap.add_argument("--no-autostart", action="store_true",
+                    help="nao liga sozinho: espera F8/ENTER")
     ap.add_argument("--config", default="flappy_config.json")
     ap.add_argument("--action", choices=["click", "space"], default="click")
     ap.add_argument("--debug", action="store_true", help="janela de debug")
@@ -928,6 +1251,6 @@ if __name__ == "__main__":
     if a.calibrate:
         calibrate(a.config)
         if input("Rodar o bot agora? [S/n] ").strip().lower() in ("", "s", "sim", "y"):
-            run(a.config, a.action, a.debug)
+            run(a.config, a.action, a.debug, autostart=not a.no_autostart)
     else:
-        run(a.config, a.action, a.debug)
+        run(a.config, a.action, a.debug, fresh=a.recalibrate, autostart=not a.no_autostart)

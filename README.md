@@ -20,13 +20,14 @@ Se faltar alguma, o próprio script avisa e mostra o comando `pip install` pront
 Dê dois cliques em **`flappy_bot.bat`**. Ele acha o Python, oferece instalar as bibliotecas que faltarem e abre um menu:
 
 ```
-  1) Iniciar bot
-  2) Calibrar (outro jogo, janela movida...)
-  3) Alternar pulo (clique / espaco)
-  4) Alternar janela de debug
-  5) Trocar arquivo de config
-  6) Instalar / atualizar bibliotecas
-  7) Ajuda
+  1) Iniciar bot (acha o jogo sozinho)
+  2) Procurar o jogo de novo (ignora a calibracao salva)
+  3) Calibrar manualmente (F9/ENTER + marcar a area)
+  4) Alternar pulo (clique / espaco)
+  5) Alternar janela de debug
+  6) Trocar arquivo de config
+  7) Instalar / atualizar bibliotecas
+  8) Ajuda
   0) Sair
 ```
 
@@ -38,17 +39,19 @@ O topo do menu mostra qual config está em uso, se ele já foi calibrado, o modo
 python flappy_bot.py
 ```
 
-1. Na primeira execução ele entra na **calibração** (veja abaixo) e salva o resultado em `flappy_config.json`.
-2. Depois disso, clique no jogo, comece a partida e aperte **F8** para ligar o bot.
-3. **ESC** encerra.
+1. Abra o jogo, deixe a janela visível e **comece a partida**.
+2. O bot procura o jogo sozinho (veja [Calibração automática](#calibração-automática)), salva o resultado em `flappy_config.json` e liga depois de contar 3 s.
+3. **F8** pausa ou liga de novo; **ESC** encerra.
 
-Nas próximas vezes ele usa a calibração salva direto.
+Nas próximas vezes ele usa a calibração salva direto. Se não vir o pássaro por 8 s com o bot ligado, procura o jogo de novo sozinho.
 
 ### Opções
 
 | Opção | O que faz |
 |---|---|
-| `--calibrate` | Refaz a calibração (outro jogo, outro site, janela movida) e pergunta se já quer rodar o bot |
+| `--recalibrate` | Ignora a calibração salva e procura o jogo de novo sozinho |
+| `--calibrate` | Calibração manual (F9 e marcar a área com o mouse) e pergunta se já quer rodar o bot |
+| `--no-autostart` | Não liga sozinho: espera F8 (ou ENTER no terminal) |
 | `--action space` | Pula com a tecla espaço em vez de clicar no centro da área do jogo |
 | `--debug` | Abre uma janela mostrando o que o bot está vendo |
 | `--config X.json` | Usa outro arquivo de calibração (dá para ter um por jogo) |
@@ -59,15 +62,43 @@ Exemplo: `python flappy_bot.py --config site2.json --action space --debug`
 
 | Tecla | Onde | Ação |
 |---|---|---|
-| F9 | calibração | Captura a tela |
-| ESC | calibração | Cancela |
-| F8 | jogo | Liga / pausa o bot |
+| F9 | calibração manual | Captura a tela |
+| ESC | calibração manual | Cancela |
+| Q ou ESC no terminal | busca automática | Cancela |
+| F8 | jogo | Pausa / liga o bot |
 | ESC | jogo | Sai |
 | Mouse no canto superior esquerdo | jogo | Parada de emergência (failsafe do pyautogui) |
 
 As teclas são globais, então funcionam com o jogo em foco.
 
-## Calibração
+**F9 ou F8 não funcionam?** Isso acontece em notebook, onde as teclas F podem exigir `Fn`, ou em janelas que seguram o teclado. No Windows, clique na janela do terminal e use:
+
+| Tecla no terminal | Ação |
+|---|---|
+| ENTER (na calibração) | Conta 3 s e captura a tela. Dá tempo de deixar o jogo visível |
+| ENTER (no jogo) | Liga (com contagem de 3 s) / pausa o bot |
+| Q | Sai |
+
+### Celular espelhado com scrcpy
+
+1. Espelhe o celular com o [scrcpy](https://github.com/Genymobile/scrcpy) e abra o jogo.
+2. Inicie o bot e comece a partida. A busca automática acha a janela do scrcpy, que tem o nome do aparelho.
+3. Use o pulo por **clique**: o scrcpy transforma o clique em toque no celular. A tecla espaço não funciona aqui.
+4. Se mover ou redimensionar a janela do scrcpy, o bot percebe e procura de novo.
+
+## Calibração automática
+
+Quando não há calibração salva (ou com `--recalibrate` / opção 2 do menu), o bot:
+
+1. Lista as janelas abertas e captura cada uma.
+2. Em cada uma, procura uma cor que forme canos (estruturas verticais com um vão) e uma mancha compacta de outra cor (o pássaro).
+3. Recorta a área de jogo: do topo do cano de cima até o pé do cano de baixo. Assim a barra de título, a barra de status do celular e o chão ficam de fora.
+4. **Confirma** observando a área por cerca de 0,6 s: os canos precisam andar para a esquerda e o pássaro precisa continuar aparecendo. Por isso uma imagem parada (ou a tela de game over) não conta. É preciso estar jogando.
+5. Salva em `flappy_config.json` e liga o bot.
+
+Se demorar a achar, mantenha o pássaro vivo até os canos aparecerem. Se não achar de jeito nenhum (cores muito parecidas, cenário muito colorido), use a calibração manual.
+
+## Calibração manual
 
 1. Abra o jogo com o pássaro e pelo menos um cano visíveis (se der, pause).
 2. Com o jogo em foco, aperte **F9**.
@@ -78,9 +109,9 @@ As teclas são globais, então funcionam com o jogo em foco.
    - **R**: recapturar (aperte F9 de novo, mesma área)
    - **ESC**: sair
 
-O arquivo salvo guarda a área da tela (`roi`), a cor HSV do pássaro e dos canos e a posição horizontal do pássaro. Se você mover ou redimensionar a janela do jogo, calibre de novo.
+O arquivo salvo guarda a área da tela (`roi`), a cor HSV do pássaro e dos canos e a posição horizontal do pássaro.
 
-> A captura da calibração usa o **monitor principal**. Em quem tem mais de uma tela, deixe o jogo nele.
+> A captura da calibração manual usa o **monitor principal**. A automática olha todas as telas.
 
 ## Como funciona
 
@@ -140,6 +171,7 @@ Chaves opcionais do planejador: `robust` (ex.: `0.1` só considera uma ação se
 
 ## Problemas comuns
 
+- **A busca automática não acha o jogo**: confira se a janela está visível e sem nada por cima, e se a partida está rolando (canos andando). Se ainda assim não achar, use `--calibrate` (opção 3 do menu).
 - **Não acha o pássaro ou os canos**: refaça com `--calibrate` e use **M** para marcar à mão. Se ainda falhar, aumente `h_tol` / `s_tol` / `v_tol`.
 - **Clica no lugar errado (Windows com escala 125%, 150%…)**: o script já ativa o modo "DPI aware" para corrigir isso. Se persistir, deixe a escala do Windows em 100%.
 - **Bate na parte de baixo do cano**: aumente `margin` ou `y_margin`.
